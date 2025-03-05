@@ -9,4 +9,6 @@ Parts list:
 6.  12v water pump, choose your capacity based upon the area and flow you need:  https://www.amazon.com/dp/B0CKRY3G8Q?ref_=ppx_hzsearch_conn_dt_b_fed_asin_title_1
 7. Some shrink tubing to make connections tight:  https://www.amazon.com/dp/B01MFA3OFA
 8. power connectors from your power/brain box to the pump enclosure.  I like these but any gauge that can handle your pump will do:  https://www.amazon.com/dp/B07WDBLFDN
-9. 
+9. Capacitive soil moisture sensor - make sure to get corrosion proof versions like these:  https://www.amazon.com/dp/B0BTHL6M19?ref_=ppx_hzsearch_conn_dt_b_fed_asin_title_1
+10. 12V to USB power connector (if you have a battery involved) :  https://www.amazon.com/dp/B0C85Q9533
+11. some assortment of lever wire connectors, to join a couple load and ground wires.  You can use other things but these just work well:  https://www.harborfreight.com/compact-lever-wire-connector-assortment-25-piece-70056.html
