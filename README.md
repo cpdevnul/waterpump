@@ -13,3 +13,4 @@ Parts list:
 10. 12V to USB power connector (if you have a battery involved) :  https://www.amazon.com/dp/B0C85Q9533
 11. some assortment of lever wire connectors, to join a couple load and ground wires.  You can use other things but these just work well:  https://www.harborfreight.com/compact-lever-wire-connector-assortment-25-piece-70056.html
 12. Tubing/hoses to match the water pump you choose.  This may not be needed if you are just using valves for pressurized water.
+13. Single channel relay like this:https://a.co/d/gGNozj5
