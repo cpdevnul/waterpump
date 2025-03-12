@@ -1,0 +1,110 @@
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <avr/wdt.h> // Include the watchdog timer library
+
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+const int AirValue = 474;      // Calibrate these values for your sensor and soil
+const int WaterValue = 201;     // Calibrate these values for your sensor and soil
+int soilMoistureValue = 0;
+const int RelayPin = 2;
+const float hysteresis = 5.0; // Adjust as needed
+const int errorLow = 0;         // Lowest possible analog read
+const int errorHigh = 1023;       // Highest possible analog read
+bool sensorError = false;       // Flag to indicate sensor error
+
+unsigned long previousMillis = 0; // will store last time moisture was read
+const long interval = 60000;      // interval at which to read (milliseconds) 60000 = 1 minute
+
+void setup() {
+  lcd.init();
+  lcd.backlight();
+  Serial.begin(9600);
+  lcd.begin(16, 2);
+  pinMode(RelayPin, OUTPUT);
+  digitalWrite(RelayPin, LOW); // Relay starts off
+  Wire.begin();              // Initialize I2C
+  wdt_enable(WDTO_4S);        // Enable the watchdog timer with a 4-second timeout
+}
+
+void loop() {
+  unsigned long currentMillis = millis();
+
+  // Check I2C communication with the LCD
+  Wire.beginTransmission(0x27);
+  if (Wire.endTransmission() != 0) {
+    Serial.println("Error: LCD not found at address 0x27");
+    lcd.clear();
+    lcd.print("LCD Error!");
+    delay(5000);
+    return; // Stop the loop if I2C communication fails
+  }
+
+  if (currentMillis - previousMillis >= interval) {
+    previousMillis = currentMillis;
+
+    // Read soil moisture value from the sensor
+    soilMoistureValue = analogRead(A0);
+
+    // Validate sensor reading
+    if (soilMoistureValue <= errorLow || soilMoistureValue >= errorHigh) {
+      Serial.print("Error: Invalid soil moisture sensor reading: ");
+      Serial.println(soilMoistureValue);
+      lcd.clear();
+      lcd.print("Sensor Error!");
+      sensorError = true; // Set the sensor error flag
+    } else {
+      sensorError = false; // Reset the error flag if a valid reading is obtained
+    }
+
+    Serial.println(soilMoistureValue);
+
+    lcd.setCursor(0, 0);
+    lcd.print("Moisture: ");
+    float moisturePercentage =
+        map(soilMoistureValue, AirValue, WaterValue, 0, 100);
+    lcd.print(moisturePercentage, 0);
+    lcd.print("%");
+
+    // Control Relay based on sensor error and moisture level
+    if (!sensorError) { // Only control relay if no sensor error
+      if (moisturePercentage < (35.0 - hysteresis)) {
+        digitalWrite(RelayPin, HIGH); // Relay ON (pump on)
+        lcd.setCursor(0, 1);
+        lcd.print("Pump: ON ");
+      } else if (moisturePercentage > (70.0 + hysteresis)) {
+        digitalWrite(RelayPin, LOW); // Relay OFF (pump off)
+        lcd.setCursor(0, 1);
+        lcd.print("Pump: OFF");
+      } else if (moisturePercentage >= 35.0 && moisturePercentage <= 70.0) {
+        // Keep the previous state (within hysteresis range)
+        lcd.setCursor(0, 1);
+        lcd.print("Pump: ");
+        if (digitalRead(RelayPin) == HIGH) {
+          lcd.print("ON ");
+        } else {
+          lcd.print("OFF");
+        }
+      }
+    } else {
+      // Sensor error: Ensure relay is OFF and display error message
+      digitalWrite(RelayPin, LOW);
+      lcd.setCursor(0, 1);
+      lcd.print("Sensor Err! Pump OFF");
+    }
+  } else {
+        //If it has not been a minute, just update the pump status on the LCD.
+        lcd.setCursor(0, 1);
+        lcd.print("Pump: ");
+        if (digitalRead(RelayPin) == HIGH) {
+          lcd.print("ON ");
+        } else {
+          lcd.print("OFF");
+        }
+  }
+
+  // Reset the watchdog timer at the end of the loop
+  wdt_reset();
+
+  delay(100); // reduced delay to prevent blocking.
+}
