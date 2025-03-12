@@ -62,6 +62,8 @@ void loop() {
     Serial.println(soilMoistureValue);
 
     lcd.setCursor(0, 0);
+    lcd.print("                "); // Clear the first line
+    lcd.setCursor(0, 0);
     lcd.print("Moisture: ");
     float moisturePercentage = map(soilMoistureValue, AirValue, WaterValue, 0, 100);
     lcd.print(moisturePercentage, 0);
