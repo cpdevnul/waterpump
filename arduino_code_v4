@@ -1,0 +1,115 @@
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <avr/wdt.h>
+
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+const int AirValue = 500;
+const int WaterValue = 192;
+int soilMoistureValue = 0;
+const int RelayPin = 2;
+const float hysteresis = 5.0;
+const int errorLow = 130;
+const int errorHigh = 650;
+bool sensorError = false;
+bool previousSensorError = false; // Add previous sensor error state
+
+unsigned long previousMillis = 0;
+const long interval = 15000; // 15 seconds
+
+unsigned long pumpStartTime = 0;
+const unsigned long maxPumpRunTime = 20 * 60 * 1000; // 20 minutes
+bool pumpRunning = false;
+
+void setup() {
+  lcd.init();
+  lcd.backlight();
+  Serial.begin(9600);
+  lcd.begin(16, 2);
+  pinMode(RelayPin, OUTPUT);
+  digitalWrite(RelayPin, LOW);
+  Wire.begin();
+  wdt_enable(WDTO_4S);
+}
+
+void loop() {
+  unsigned long currentMillis = millis();
+
+  Wire.beginTransmission(0x27);
+  if (Wire.endTransmission() != 0) {
+    Serial.println("Error: LCD not found at address 0x27");
+    lcd.clear();
+    lcd.print("LCD Error!");
+    delay(5000);
+    return;
+  }
+
+  if (currentMillis - previousMillis >= interval) {
+    previousMillis = currentMillis;
+
+    soilMoistureValue = analogRead(A0);
+
+    if (soilMoistureValue <= errorLow || soilMoistureValue >= errorHigh) {
+      Serial.print("Error: Invalid soil moisture sensor reading: ");
+      Serial.print(soilMoistureValue);
+      Serial.println(". Check sensor and wiring.");
+      sensorError = true;
+    } else {
+      sensorError = false;
+    }
+
+    Serial.print("Moisture Value: ");
+    Serial.println(soilMoistureValue);
+
+    lcd.setCursor(0, 0);
+    lcd.print("Moisture: ");
+    float moisturePercentage = map(soilMoistureValue, AirValue, WaterValue, 0, 100);
+    lcd.print(moisturePercentage, 0);
+    lcd.print("%");
+
+    if (sensorError != previousSensorError) { // Only clear if sensor error status changed
+        lcd.clear();
+        previousSensorError = sensorError;
+    }
+
+    if (!sensorError) {
+      if (moisturePercentage < (40.0 - hysteresis)) {
+        if (!pumpRunning) {
+          digitalWrite(RelayPin, HIGH);
+          pumpStartTime = currentMillis;
+          pumpRunning = true;
+          Serial.println("Pump turned ON.");
+        }
+      } else if (moisturePercentage > (65.0 + hysteresis) || (pumpRunning && (currentMillis - pumpStartTime >= maxPumpRunTime))) {
+        digitalWrite(RelayPin, LOW);
+        pumpRunning = false;
+        Serial.println("Pump turned OFF.");
+      } else if (moisturePercentage >= (40.0 - hysteresis) && moisturePercentage <= (65.0 + hysteresis)){
+          Serial.println("Moisture within range");
+      }
+      lcd.setCursor(0, 1);
+      lcd.print("Pump: ");
+      if (digitalRead(RelayPin) == HIGH) {
+        lcd.print("ON ");
+      } else {
+        lcd.print("OFF");
+      }
+    } else {
+      digitalWrite(RelayPin, LOW);
+      pumpRunning = false;
+      lcd.setCursor(0, 1);
+      lcd.print("Sensor Err! OFF");
+    }
+  } else {
+    lcd.setCursor(0, 1);
+    lcd.print("Pump: ");
+    if (digitalRead(RelayPin) == HIGH) {
+      lcd.print("ON ");
+    } else {
+      lcd.print("OFF");
+    }
+  }
+
+  wdt_reset();
+  delay(100);
+}
