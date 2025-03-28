@@ -1,0 +1,262 @@
+// =========================================================================
+// Version 5.3: Integrated Sensor Reading Averaging (Rec #2)
+// Based on Version 5.2 (which included Rec #1, Rec #4, and threshold mods)
+// =========================================================================
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <avr/wdt.h>
+
+// Initialize the LCD library with the I2C address (0x27 common) and dimensions (16x2)
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+// --- Calibration & Thresholds ---
+// Sensor reading in air (calibrate this!)
+const int AirValue = 500;
+// Sensor reading in water (calibrate this!)
+const int WaterValue = 192;
+// Pin connected to the relay controlling the pump
+const int RelayPin = 2;
+// Hysteresis value to prevent rapid pump cycling near thresholds
+const float hysteresis = 5.0; // Percentage points
+// Sensor reading values that likely indicate an error (calibrate if needed)
+const int errorLow = 130;  // Reading below this might mean a short or always wet
+const int errorHigh = 650; // Reading above this might mean disconnection or always dry
+
+// --- Sensor Averaging Configuration (Rec #2 Integration) ---
+const int numReadings = 5; // Number of readings to average
+const int readingDelay = 10; // Delay between readings (milliseconds)
+
+// --- Timing Configuration ---
+// Variable to store the last time the main logic ran
+unsigned long previousMillis = 0;
+// Interval between sensor checks and logic updates (15 seconds)
+const long interval = 15000;
+
+// --- Pump Control Variables ---
+// Timestamp when the pump was last started
+unsigned long pumpStartTime = 0;
+// Flag indicating if the pump is currently supposed to be running
+bool pumpRunning = false;
+// Minimum delay after pump turns OFF before it can turn ON again (30 seconds)
+unsigned long pumpRestartDelay = 30000;
+// Timestamp when the pump was last turned off
+unsigned long pumpOffTime = 0;
+
+// --- Max Runtime Safety Feature ---
+// Set the maximum time the pump can run continuously (20 minutes = 20 * 60 * 1000ms)
+const unsigned long maxPumpDuration = 20 * 60 * 1000UL;
+// Set the longer delay required before restarting if max runtime was hit (1 hour = 60 * 60 * 1000ms)
+const unsigned long maxRuntimeRestartDelay = 60 * 60 * 1000UL;
+// Flag to track if pump was stopped due to max runtime
+bool maxRuntimeReached = false;
+
+// --- State Variables ---
+// Stores the latest (averaged) raw reading from the soil moisture sensor
+int soilMoistureValue = 0;
+// Flag indicating if the current sensor reading is considered erroneous
+bool sensorError = false;
+// Stores the sensor error state from the previous loop iteration (for logic optimization)
+bool previousSensorError = false;
+// Stores the pump running state from the previous loop iteration (for logic optimization)
+bool previousPumpState = false;
+
+// =========================================================================
+// SETUP: Runs once when the Arduino boots or resets
+// =========================================================================
+void setup() {
+  // Initialize the LCD display
+  lcd.init();
+  // Turn on the LCD backlight
+  lcd.backlight();
+  // Start Serial communication for debugging output
+  Serial.begin(9600);
+   // Initialize the LCD size (must be done after init/backlight for some libraries)
+  lcd.begin(16, 2);
+  // Configure the relay pin as an output
+  pinMode(RelayPin, OUTPUT);
+  // Ensure the pump is OFF initially
+  digitalWrite(RelayPin, LOW);
+  // Initialize the I2C communication bus
+  Wire.begin();
+  // Enable the Watchdog Timer with an 8-second timeout
+  // If the loop() function hangs for more than 8 seconds, the Arduino will reset
+  wdt_enable(WDTO_8S);
+
+  // Check if the LCD is connected and responding during setup
+  Wire.beginTransmission(0x27); // LCD I2C Address
+  byte error = Wire.endTransmission(); // Check connection status
+  if (error != 0) {
+    Serial.print("SETUP Error: LCD not found at address 0x27. Error code: ");
+    Serial.println(error);
+    // Don't try to print to LCD if it's not found
+  } else {
+      Serial.println("SETUP: LCD Found!");
+      lcd.clear(); // Clear the LCD screen if found
+      lcd.print("System Starting...");
+      delay(1000); // Short delay to show message
+      lcd.clear();
+  }
+  Serial.println("Setup Complete. Starting Loop (V5.3)...");
+}
+
+// =========================================================================
+// LOOP: Runs continuously after setup() completes
+// =========================================================================
+void loop() {
+  // Get the current time in milliseconds since boot
+  unsigned long currentMillis = millis();
+
+  // --- Timed Action Interval ---
+  // Check if the specified interval (15 seconds) has passed
+  if (currentMillis - previousMillis >= interval) {
+    // Update the time of the last execution
+    previousMillis = currentMillis;
+
+    // --- Sensor Reading Averaging (Rec #2 Integration) ---
+    long sensorTotal = 0; // Use long to avoid potential overflow during summation
+    for (int i = 0; i < numReadings; i++) {
+        sensorTotal += analogRead(A0); // Read sensor and add to total
+        delay(readingDelay);           // Wait a short time before next reading
+    }
+    soilMoistureValue = sensorTotal / numReadings; // Calculate the average reading
+    // --- End of Sensor Reading Averaging ---
+
+    // --- Sensor Error Checking (Uses the averaged value) ---
+    if (soilMoistureValue <= errorLow || soilMoistureValue >= errorHigh || soilMoistureValue <= 0 || soilMoistureValue >= 1023) {
+      // Only print error message if it's a new error state
+      if (!sensorError) {
+          Serial.print(currentMillis / 1000); // Simple timestamp (seconds)
+          Serial.print("s - Error Start: Invalid sensor reading (Avg): ");
+          Serial.println(soilMoistureValue);
+      }
+      sensorError = true;
+    } else {
+       // Only print message if error state is clearing
+       if(sensorError) {
+           Serial.print(currentMillis / 1000);
+           Serial.println("s - Error Cleared: Sensor reading OK (Avg).");
+       }
+      sensorError = false;
+    }
+
+    // Log the current averaged raw moisture value if no error
+    if (!sensorError) {
+        Serial.print(currentMillis / 1000); // Simple timestamp (seconds)
+        Serial.print("s - Moisture Value (Avg): ");
+        Serial.print(soilMoistureValue);
+    }
+
+    // --- Percentage Calculation (Uses the averaged value) ---
+    float moisturePercentage = map(soilMoistureValue, AirValue, WaterValue, 0, 100);
+    moisturePercentage = constrain(moisturePercentage, 0, 100);
+
+    if (!sensorError) {
+        Serial.print(" | Percentage: ");
+        Serial.print(moisturePercentage, 0); // Print percentage with 0 decimal places
+        Serial.println("%");
+    }
+
+    // --- I2C LCD Robustness Check ---
+    Wire.beginTransmission(0x27); // LCD Address
+    byte lcdError = Wire.endTransmission();
+
+    // --- LCD Update Section ---
+    if (lcdError == 0) { // Only attempt LCD updates if connection is OK
+
+        // Update LCD Line 0: Moisture Percentage (Always update if LCD OK)
+        lcd.setCursor(0, 0);
+        lcd.print("Moisture: ");
+        if (sensorError) {
+            lcd.print("ERR");
+        } else {
+            lcd.print(moisturePercentage, 0);
+            lcd.print("%");
+        }
+        lcd.print("   "); // Spaces to overwrite previous longer values
+
+        // Update LCD Line 1 based on current state
+        if (sensorError) {
+            lcd.setCursor(0, 1);
+            lcd.print("Sensor Err! OFF ");
+        } else if (pumpRunning != previousPumpState) {
+             lcd.setCursor(0, 1);
+             lcd.print("Pump: ");
+             if (pumpRunning) {
+                 lcd.print("ON         ");
+             } else {
+                 if (maxRuntimeReached) {
+                     lcd.print("OFF (Max)  ");
+                 } else {
+                     lcd.print("OFF        ");
+                 }
+             }
+        } // Else: No state change, no error -> No LCD write needed for Line 1
+
+    } else { // --- LCD Connection Error Handling ---
+        // Log warning if LCD communication failed during this cycle
+        Serial.print(currentMillis / 1000);
+        Serial.println("s - Warning: LCD connection error during update.");
+    }
+
+
+    // --- Main Pump Control Logic (Uses averaged percentage) ---
+    if (!sensorError) { // Only run pump logic if the sensor reading is valid
+
+      // 1. Check for Max Runtime Condition FIRST
+      if (pumpRunning && (currentMillis - pumpStartTime >= maxPumpDuration)) {
+        digitalWrite(RelayPin, LOW);
+        pumpRunning = false;
+        pumpOffTime = currentMillis;
+        maxRuntimeReached = true;
+        if (pumpRunning != previousPumpState) { // Check state *before* previousPumpState update
+             Serial.print(currentMillis / 1000);
+             Serial.println("s - Pump turned OFF - Max Runtime Reached (20 min).");
+        }
+      }
+      // 2. Check if Pump Should Turn ON
+      else if (moisturePercentage < (50.0 - hysteresis) && !pumpRunning &&
+               (currentMillis - pumpOffTime >= (maxRuntimeReached ? maxRuntimeRestartDelay : pumpRestartDelay)))
+      {
+        digitalWrite(RelayPin, HIGH);
+        pumpStartTime = currentMillis;
+        pumpRunning = true;
+        maxRuntimeReached = false;
+        if (pumpRunning != previousPumpState) { // Check state *before* previousPumpState update
+            Serial.print(currentMillis / 1000);
+            Serial.println("s - Pump turned ON.");
+        }
+      }
+      // 3. Check if Pump Should Turn OFF (Normal operation)
+      else if (moisturePercentage > (65.0 + hysteresis) && pumpRunning) {
+        digitalWrite(RelayPin, LOW);
+        pumpRunning = false;
+        pumpOffTime = currentMillis;
+        if (pumpRunning != previousPumpState) { // Check state *before* previousPumpState update
+            Serial.print(currentMillis / 1000);
+            Serial.println("s - Pump turned OFF - Moisture OK.");
+        }
+      }
+      // 4. No change needed
+
+    } else { // --- Sensor Error Handling ---
+      if (digitalRead(RelayPin) == HIGH) {
+           digitalWrite(RelayPin, LOW);
+           if (pumpRunning != previousPumpState) { // Check against previous state *before* updating pumpRunning
+               Serial.print(currentMillis / 1000);
+               Serial.println("s - Pump turned OFF due to Sensor Error.");
+           }
+           pumpOffTime = currentMillis;
+      }
+      pumpRunning = false;
+      maxRuntimeReached = false;
+    }
+
+    // --- Update Previous States (CRITICAL: Do this *after* all logic for the cycle) ---
+    previousPumpState = pumpRunning;
+    previousSensorError = sensorError;
+
+  } // End of `if (currentMillis - previousMillis >= interval)` block
+
+  // --- Watchdog Timer Reset ---
+  wdt_reset();
+} // End of loop() function
