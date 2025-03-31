@@ -1,0 +1,286 @@
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include "esp_task_wdt.h"
+#include "esp_system.h"
+#include <time.h> // Include the time library
+
+// OLED display setup
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 32
+#define OLED_RESET -1
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// --- Wi-Fi Credentials ---
+const char* ssid = "mynet";
+const char* password = "Disney54915!";
+
+// --- Server Details ---
+const char* serverName = "your_server.com";
+const char* serverPath = "/your_data_endpoint";
+
+// --- Calibration & Thresholds ---
+const int AirValue = 2048;
+const int WaterValue = 768;
+const int RelayPin = 15;
+const float hysteresis = 5.0;
+const int errorLow = 650;
+const int errorHigh = 3276;
+
+// --- Sensor Averaging Configuration ---
+const int numReadings = 5;
+const int readingDelay = 10;
+
+// --- Timing Configuration ---
+unsigned long previousMillis = 0;
+const long interval = 15000;
+
+// --- Pump Control Variables ---
+unsigned long pumpStartTime = 0;
+bool pumpRunning = false;
+unsigned long pumpRestartDelay = 30000;
+unsigned long pumpOffTime = 0;
+
+// --- Max Runtime Safety Feature ---
+const unsigned long maxPumpDuration = 20 * 60 * 1000UL;
+const unsigned long maxRuntimeRestartDelay = 60 * 60 * 1000UL;
+bool maxRuntimeReached = false;
+
+// --- State Variables ---
+int soilMoistureValue = 0;
+bool sensorError = false;
+bool previousSensorError = false;
+bool previousPumpState = false;
+
+// --- Wi-Fi Setup ---
+bool setupWiFi();
+
+// --- Send Data to Server ---
+void sendDataToServer(float moisture, bool pumpState, bool errorState);
+
+// --- Get and Print Time ---
+void printLocalTime();
+
+// --- NTP Server Settings ---
+const char* ntpServer = "pool.ntp.org"; // You can use other NTP servers
+const long gmtOffset_sec = -7 * 3600;   // PST offset (adjust for your timezone)
+const int daylightOffset_sec = 3600;    // Daylight saving time offset
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println("Starting setup()");
+
+  // OLED Initialization
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println(F("SSD1306 allocation failed"));
+    for (;;);
+  }
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(WHITE);
+  display.setCursor(0, 0);
+  display.println("System Start");
+  display.display();
+  delay(2000);
+
+  // Connect to Wi-Fi
+  if (!setupWiFi()) {
+    Serial.println("Failed to setup WiFi, restarting...");
+    display.clearDisplay();
+    display.setCursor(0, 0);
+    display.println("WiFi Setup Fail!");
+    display.display();
+    delay(5000);
+    ESP.restart();
+    return; // Stop setup if Wi-Fi fails
+  }
+
+  // Init and get the time
+  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+  printLocalTime();
+
+  pinMode(RelayPin, OUTPUT);
+  digitalWrite(RelayPin, LOW);
+  Wire.begin();
+
+  // ESP32 Watchdog Timer Setup
+  esp_task_wdt_config_t twdt_config = {
+      .timeout_ms = 16000, // Increased timeout
+      .idle_core_mask = (1 << portGET_CORE_ID()),
+      .trigger_panic = false
+  };
+  esp_task_wdt_init(&twdt_config);
+  esp_task_wdt_add(NULL);
+
+  Serial.println("Setup Complete.");
+}
+
+void loop() {
+  unsigned long currentMillis = millis();
+  esp_task_wdt_reset();
+  Serial.println("Loop Start");
+
+  // --- Timing Control ---
+  // This is the CRITICAL change: We update previousMillis *only* when the interval has passed
+  if (currentMillis - previousMillis >= interval) {
+    previousMillis = currentMillis; // Update previousMillis HERE
+
+    long sensorTotal = 0;
+    for (int i = 0; i < numReadings; i++) {
+      sensorTotal += analogRead(36);
+      delay(readingDelay);
+    }
+    soilMoistureValue = sensorTotal / numReadings;
+
+    if (soilMoistureValue <= errorLow || soilMoistureValue >= errorHigh || soilMoistureValue <= 0 || soilMoistureValue >= 4095) {
+      sensorError = true;
+    } else {
+      sensorError = false;
+    }
+
+    float moisturePercentage = map(soilMoistureValue, AirValue, WaterValue, 0, 100);
+    moisturePercentage = constrain(moisturePercentage, 0, 100);
+
+    // OLED Display Update
+    display.clearDisplay();
+    display.setCursor(0, 0);
+    display.print("Moisture: ");
+    if (sensorError) {
+      display.print("ERR");
+    } else {
+      display.print(moisturePercentage, 0);
+      display.print("%");
+    }
+
+    display.setCursor(0, 10);
+    display.print("Pump: ");
+    if (sensorError) {
+      display.print("OFF (Err)");
+    } else if (pumpRunning) {
+      display.print("ON");
+    } else if (maxRuntimeReached) {
+      display.print("OFF (Max)");
+    } else {
+      display.print("OFF");
+    }
+    display.display();
+
+    // --- Send data to server ---
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.println("Sending data to server...");
+      sendDataToServer(moisturePercentage, pumpRunning, sensorError);
+    } else {
+      Serial.println("WiFi not connected. Cannot send data.");
+    }
+
+    if (!sensorError) {
+      if (pumpRunning && (currentMillis - pumpStartTime >= maxPumpDuration)) {
+        digitalWrite(RelayPin, LOW);
+        pumpRunning = false;
+        pumpOffTime = currentMillis;
+        maxRuntimeReached = true;
+      } else if (moisturePercentage < (50.0 - hysteresis) && !pumpRunning &&
+               (currentMillis - pumpOffTime >= (maxRuntimeReached ? maxRuntimeRestartDelay : pumpRestartDelay))) {
+        digitalWrite(RelayPin, HIGH);
+        pumpStartTime = currentMillis;
+        pumpRunning = true;
+        maxRuntimeReached = false;
+      } else if (moisturePercentage > (65.0 + hysteresis) && pumpRunning) {
+        digitalWrite(RelayPin, LOW);
+        pumpRunning = false;
+        pumpOffTime = currentMillis;
+      }
+    } else {
+      if (digitalRead(RelayPin) == HIGH) {
+        digitalWrite(RelayPin, LOW);
+        pumpOffTime = currentMillis;
+      }
+      pumpRunning = false;
+      maxRuntimeReached = false;
+    }
+
+    previousPumpState = pumpRunning;
+    previousSensorError = sensorError;
+  }
+  Serial.println("End of loop()");
+}
+
+bool setupWiFi() {
+  WiFi.mode(WIFI_STA);
+  IPAddress staticIP(192, 168, 1, 150); // Adjust to your network
+  IPAddress gateway(192, 168, 1, 1);    // Adjust to your router
+  IPAddress subnet(255, 255, 255, 0);
+  IPAddress dns(192, 168, 1, 1);
+
+  if (!WiFi.config(staticIP, gateway, subnet, dns)) {
+    Serial.println("Failed to configure static IP, using DHCP");
+  }
+
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to ");
+  Serial.println(ssid);
+
+  int wifi_connect_counter = 0;
+  while (WiFi.status() != WL_CONNECTED && wifi_connect_counter < 60) {
+    delay(500);
+    Serial.print(".");
+    wifi_connect_counter++;
+    Serial.print("WiFi Status: ");
+    Serial.println(WiFi.status());
+  }
+
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("Failed to connect to WiFi!");
+    return false; // Indicate failure
+  }
+
+  Serial.println("");
+  Serial.println("WiFi connected");
+  Serial.print("IP address: ");
+  Serial.println(WiFi.localIP());
+  return true; // Indicate success
+}
+
+void sendDataToServer(float moisture, bool pumpState, bool errorState) {
+  HTTPClient http;
+  Serial.println("sendDataToServer() called");
+
+  String data = "moisture=" + String(moisture) + "&pump=" + String(pumpState) + "&error=" + String(errorState);
+
+  http.begin(serverName, 80, serverPath);
+  http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+  http.setTimeout(10000); // 10 seconds timeout
+
+  Serial.println("Sending data: " + data);
+
+  int httpResponseCode = http.POST(data);
+
+  Serial.print("HTTP Response code: ");
+  Serial.println(httpResponseCode);
+
+  if (httpResponseCode > 0) {
+    if (httpResponseCode == HTTP_CODE_OK) {
+      String payload = http.getString();
+      Serial.println("Payload: " + payload);
+    } else {
+      Serial.println("Error receiving payload");
+    }
+  } else {
+    Serial.print("HTTP Error code: ");
+    Serial.println(httpResponseCode);
+    Serial.println(http.errorToString(httpResponseCode)); // Get error string
+  }
+  http.end();
+  Serial.println("sendDataToServer() finished");
+}
+
+void printLocalTime() {
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) {
+    Serial.println("Failed to obtain time");
+    return;
+  }
+  Serial.println(&timeinfo, "%A, %B %d %Y %H:%M:%S");
+}
