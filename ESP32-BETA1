@@ -1,0 +1,337 @@
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h> // For I2C LCD
+#include <WiFi.h>
+#include <time.h>              // For time functions
+#include <WiFiClientSecure.h>  // For HTTPS
+#include <HTTPClient.h>        // For HTTP requests
+#include <UrlEncode.h>         // For encoding URL parameters (Install via Library Manager)
+
+// --- Pin Definitions ---
+#define RELAY_PIN 17    // ESP32 pin GPIO17 that connects to relay
+#define MOISTURE_PIN 36 // ESP32 pin GPIO36 (ADC0) that connects to AOUT pin of moisture sensor
+
+// --- Calibration Values ---
+const int AirValue = 3000;  // Calibrate this value in air (sensor out of soil)
+const int WaterValue = 1110; // Calibrate this value in water (sensor fully submerged)
+
+// --- LCD Display Setup ---
+const int LCD_I2C_ADDR = 0x27; // <<< SET YOUR LCD I2C ADDRESS HERE (e.g., 0x27 or 0x3F)
+const int LCD_COLS = 16;       // Number of columns (e.g., 16 or 20)
+const int LCD_ROWS = 2;        // Number of rows (e.g., 2 or 4)
+LiquidCrystal_I2C lcd(LCD_I2C_ADDR, LCD_COLS, LCD_ROWS);
+
+// --- Wi-Fi Credentials ---
+const char *ssid = "PUT SSID HERE";       // <<< SET YOUR WIFI SSID HERE
+const char *password = "PUT PASSWORD HERE"; // <<< SET YOUR WIFI PASSWORD HERE
+
+// --- Google Apps Script ---
+// Replace with YOUR Google Apps Script Web App URL
+String GAS_URL = "https://script.google.com/macros/s/YOUR_DEPLOYMENT_ID_HERE/exec"; // <<< SET YOUR GAS URL HERE
+
+// --- NTP Time Setup ---
+const char* ntpServer = "pool.ntp.org";
+const long gmtOffset_sec = -7 * 3600; // UTC-7 MST (Arizona), No DST
+const int daylightOffset_sec = 0;
+struct tm timeinfo;
+// Buffer includes space for YYYY-MM-DD HH:MM:SS and null terminator
+char dateTimeStringBuff[20];
+
+// --- Timing ---
+const long sampleInterval = 10000; // Sample moisture every 10 seconds
+unsigned long lastSampleTime = 0;
+const long timeUpdateInterval = 1000; // Update displayed time every 1 second
+unsigned long lastTimeUpdate = 0;
+// Interval for sending data to Google Sheet (e.g., every 5 minutes)
+const long sheetUpdateInterval = 5 * 60 * 1000; // 5 minutes in milliseconds
+unsigned long lastSheetUpdate = 0;
+
+// --- Pump Control ---
+const unsigned long maxPumpRunTime = 25 * 60 * 1000; // 25 minutes
+unsigned long pumpStartTime = 0;
+bool pumpIsRunning = false;
+
+// --- Wi-Fi Connection Parameters ---
+const unsigned long wifiReconnectInterval = 60 * 1000; // Reconnect attempt interval (60s)
+bool wifiConnected = false; // Global flag for Wi-Fi status
+unsigned long lastWiFiReconnectTime = 0;
+
+// --- Hysteresis Parameters ---
+const float moistureThresholdDry = 40.0;
+const float moistureHysteresis = 5.0;
+
+// --- Function Prototypes ---
+void updateMoistureAndPump(float moisturePercentage, unsigned long currentMillis);
+void checkPumpRuntime(unsigned long currentMillis);
+bool connectWiFi(); // *** Has return type bool ***
+void checkWiFiConnection();
+void sendDataToGoogleSheet(float moisture, const char* timestamp);
+
+// =========================================================================
+// SETUP
+// =========================================================================
+void setup()
+{
+    Serial.begin(9600);
+    pinMode(RELAY_PIN, OUTPUT);
+    digitalWrite(RELAY_PIN, LOW);
+    analogSetAttenuation(ADC_11db);
+
+    Wire.begin();
+    lcd.init();
+    lcd.backlight();
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("System Starting");
+    Serial.println("System Starting...");
+    delay(1000);
+
+    wifiConnected = connectWiFi(); // Connect to Wi-Fi
+
+    // Configure NTP Time (only if Wi-Fi connected)
+    if (wifiConnected)
+    {
+        lcd.clear(); lcd.setCursor(0, 0); lcd.print("WiFi OK");
+        lcd.setCursor(0, 1); lcd.print("Syncing time...");
+        Serial.println("WiFi Connected. Configuring time from NTP...");
+        configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+
+        int sync_attempts = 0; const int max_sync_attempts = 6;
+        while (!getLocalTime(&timeinfo, 5000)) {
+            Serial.print("Failed to obtain time. Retrying... (Attempt "); Serial.print(sync_attempts + 1); Serial.println(")");
+            sync_attempts++;
+            lcd.setCursor(0, 1); lcd.print("Time Sync Fail "); lcd.print(sync_attempts);
+            if (sync_attempts >= max_sync_attempts) {
+                 Serial.println("Giving up on initial time sync.");
+                 lcd.setCursor(0, 1); lcd.print("Time Sync Failed"); delay(2000); break;
+            }
+        }
+        if (sync_attempts < max_sync_attempts) {
+             Serial.println("Time synchronized successfully.");
+             getLocalTime(&timeinfo);
+             strftime(dateTimeStringBuff, sizeof(dateTimeStringBuff), "%Y-%m-%d %H:%M:%S", &timeinfo); // Get initial date/time
+             lcd.setCursor(0, 1); lcd.print("Time Synced! ");
+             // Display only time on LCD initially after sync for space
+             strftime(dateTimeStringBuff, sizeof(dateTimeStringBuff), "%H:%M:%S", &timeinfo);
+             lcd.print(dateTimeStringBuff);
+             delay(2000);
+        }
+    } else {
+         lcd.clear(); lcd.setCursor(0, 0); lcd.print("System Start");
+         lcd.setCursor(0, 1); lcd.print("No WiFi/Time"); delay(2000);
+    }
+
+    lcd.clear(); // Clear screen ready for main loop display
+    // Initialize timers
+    lastSampleTime = millis();
+    lastTimeUpdate = millis();
+    lastWiFiReconnectTime = millis();
+    lastSheetUpdate = millis(); // Initialize sheet update timer
+}
+
+// =========================================================================
+// LOOP
+// =========================================================================
+void loop()
+{
+    unsigned long currentMillis = millis();
+
+    checkWiFiConnection(); // Check WiFi status, reconnect if needed
+    checkPumpRuntime(currentMillis); // Check pump safety timer
+
+    // Update local time display periodically
+    if (wifiConnected && (currentMillis - lastTimeUpdate >= timeUpdateInterval))
+    {
+        lastTimeUpdate = currentMillis;
+        if (getLocalTime(&timeinfo)) {
+            strftime(dateTimeStringBuff, sizeof(dateTimeStringBuff), "%H:%M:%S", &timeinfo); // Format as HH:MM:SS for LCD
+            lcd.setCursor(0, 1); lcd.print(dateTimeStringBuff);
+        } else {
+            lcd.setCursor(0, 1); lcd.print("--:--:--"); // Indicate time sync lost
+        }
+    }
+
+    // Check moisture sensor periodically
+    if (currentMillis - lastSampleTime >= sampleInterval)
+    {
+        lastSampleTime = currentMillis;
+
+        int sensorValue = analogRead(MOISTURE_PIN);
+        float moisturePercentage = map(sensorValue, AirValue, WaterValue, 0, 100);
+        moisturePercentage = constrain(moisturePercentage, 0, 100);
+
+        updateMoistureAndPump(moisturePercentage, currentMillis); // Update pump state
+
+        // Update LCD Display (Moisture + Pump Status)
+        lcd.setCursor(0, 0); lcd.print("Moist: ");
+        char moistureStr[6]; dtostrf(moisturePercentage, 4, 1, moistureStr); lcd.print(moistureStr); lcd.print("%   ");
+        lcd.setCursor(9, 1); lcd.print("Pmp:"); lcd.print(pumpIsRunning ? "ON " : "OFF");
+
+        // Log data to Google Sheet periodically
+        if (wifiConnected && (currentMillis - lastSheetUpdate >= sheetUpdateInterval)) {
+            lastSheetUpdate = currentMillis;
+            if (getLocalTime(&timeinfo)) {
+                 strftime(dateTimeStringBuff, sizeof(dateTimeStringBuff), "%Y-%m-%d %H:%M:%S", &timeinfo); // Format full date/time for sheet
+                 Serial.print("Attempting to send data to Google Sheet... Time: "); Serial.print(dateTimeStringBuff);
+                 Serial.print(" Moisture: "); Serial.println(moisturePercentage);
+                 sendDataToGoogleSheet(moisturePercentage, dateTimeStringBuff); // Send data
+            } else {
+                 Serial.println("Cannot send to Google Sheet: Time not synced.");
+            }
+        }
+
+        // Serial Debug Output
+        if(getLocalTime(&timeinfo)) strftime(dateTimeStringBuff, sizeof(dateTimeStringBuff), "%Y-%m-%d %H:%M:%S", &timeinfo); else strcpy(dateTimeStringBuff, "Time not synced");
+        Serial.print(dateTimeStringBuff);
+        Serial.print(" - Raw: "); Serial.print(sensorValue);
+        Serial.print(" Percent: "); Serial.print(moisturePercentage);
+        Serial.print("% Pump: "); Serial.println(pumpIsRunning ? "ON" : "OFF");
+    }
+}
+
+// =========================================================================
+// HELPER FUNCTIONS
+// =========================================================================
+
+/**
+ * @brief Decides pump state based on moisture and hysteresis.
+ */
+void updateMoistureAndPump(float moisturePercentage, unsigned long currentMillis) {
+    if (moisturePercentage < (moistureThresholdDry - moistureHysteresis) && !pumpIsRunning) {
+        Serial.println("-> Turning Pump ON");
+        digitalWrite(RELAY_PIN, HIGH); pumpIsRunning = true; pumpStartTime = currentMillis;
+    } else if (moisturePercentage >= (moistureThresholdDry + moistureHysteresis) && pumpIsRunning) {
+        Serial.println("-> Turning Pump OFF");
+        digitalWrite(RELAY_PIN, LOW); pumpIsRunning = false;
+    }
+}
+
+/**
+ * @brief Checks pump safety runtime limit.
+ */
+void checkPumpRuntime(unsigned long currentMillis) {
+    if (pumpIsRunning && (currentMillis - pumpStartTime >= maxPumpRunTime)) {
+        Serial.println("!!! Max pump runtime reached. Forcing Pump OFF. !!!");
+        digitalWrite(RELAY_PIN, LOW); pumpIsRunning = false;
+        lcd.clear(); lcd.setCursor(0, 0); lcd.print("Pump Runtime"); lcd.setCursor(0, 1); lcd.print("Limit Reached!");
+        delay(3000); lcd.clear();
+        lastTimeUpdate = 0; lastSampleTime = 0; // Force status update
+    }
+}
+
+/**
+ * @brief Connects to Wi-Fi with retries. Returns true on success, false on failure.
+ * *** THIS IS THE FULL FUNCTION DEFINITION ***
+ */
+bool connectWiFi()
+{
+    lcd.clear(); lcd.setCursor(0, 0); lcd.print("Connecting WiFi");
+    WiFi.mode(WIFI_STA); WiFi.begin(ssid, password);
+    Serial.print("Connecting to WiFi SSID: "); Serial.println(ssid);
+
+    int wifi_connect_counter = 0;
+    const int max_wifi_attempts = 4;
+    const unsigned long initial_wifi_delay = 1000;
+    const unsigned long wifi_delay_increment = 2000;
+
+    while (WiFi.status() != WL_CONNECTED && wifi_connect_counter < max_wifi_attempts) {
+        lcd.setCursor(wifi_connect_counter % LCD_COLS, 1); lcd.print(".");
+        unsigned long current_wifi_delay = initial_wifi_delay + (wifi_connect_counter * wifi_delay_increment);
+        Serial.print("Attempt "); Serial.print(wifi_connect_counter + 1); Serial.print(" of "); Serial.print(max_wifi_attempts);
+        Serial.print(" - Waiting "); Serial.print(current_wifi_delay / 1000.0); Serial.println(" seconds...");
+        delay(current_wifi_delay);
+        wifi_connect_counter++;
+        Serial.print("Current WiFi Status: "); Serial.println(WiFi.status());
+    }
+
+    if (WiFi.status() == WL_CONNECTED) {
+        Serial.println("\nWiFi connected successfully!"); Serial.print("IP address: "); Serial.println(WiFi.localIP());
+        lcd.clear(); lcd.setCursor(0, 0); lcd.print("WiFi Connected!"); lcd.setCursor(0, 1); lcd.print(WiFi.localIP());
+        delay(2000);
+        return true; // <<< Return true on success
+    } else {
+        Serial.println("\nFailed to connect to WiFi after multiple attempts.");
+        lcd.clear(); lcd.setCursor(0, 0); lcd.print("WiFi Connect"); lcd.setCursor(0, 1); lcd.print("Failed!");
+        delay(2000);
+        return false; // <<< Return false on failure
+    }
+}
+
+/**
+ * @brief Checks Wi-Fi connection and attempts reconnect if needed.
+ * *** THIS IS THE FULL FUNCTION DEFINITION ***
+ */
+void checkWiFiConnection()
+{
+    unsigned long currentMillis = millis();
+    if (WiFi.status() != WL_CONNECTED) {
+        if (wifiConnected) { // Only print loss message once
+            Serial.println("!!! WiFi connection lost! !!!");
+            wifiConnected = false;
+            lcd.setCursor(0, 1); lcd.print("--:--:--"); // Clear time display
+        }
+        if (currentMillis - lastWiFiReconnectTime >= wifiReconnectInterval) {
+            Serial.println("Attempting to reconnect to WiFi...");
+            lastWiFiReconnectTime = currentMillis;
+            lcd.clear(); lcd.setCursor(0, 0); lcd.print("WiFi Lost"); lcd.setCursor(0, 1); lcd.print("Reconnecting...");
+            wifiConnected = connectWiFi(); // Attempt reconnect
+
+            if (wifiConnected) {
+                 Serial.println("Reconnected. Verifying time sync...");
+                 lcd.clear(); lcd.setCursor(0,0); lcd.print("Reconnected!"); lcd.setCursor(0,1); lcd.print("Checking Time...");
+                 delay(1000); // Give NTP a moment
+                 if (!getLocalTime(&timeinfo, 2000)) {
+                     Serial.println("Time sync pending after reconnect."); lcd.setCursor(0,1); lcd.print("Time Sync Pend");
+                 } else {
+                     Serial.println("Time OK after reconnect."); lcd.setCursor(0,1); lcd.print("Time OK!      ");
+                 }
+                 delay(1500); lcd.clear();
+                 lastTimeUpdate = 0; lastSampleTime = 0; // Force status update
+            } else {
+                 lcd.clear(); lcd.setCursor(0,0); lcd.print("Reconnect Fail"); delay(2000); lcd.clear();
+            }
+        }
+    } else { // WiFi.status() == WL_CONNECTED
+        if (!wifiConnected) { // Connection was just re-established
+            Serial.println("WiFi connection re-established.");
+            wifiConnected = true;
+            lastTimeUpdate = 0; lastSampleTime = 0; // Force status update
+        }
+    }
+}
+
+/**
+ * @brief Sends data to Google Apps Script via HTTPS GET.
+ */
+void sendDataToGoogleSheet(float moisture, const char* timestamp) {
+    if (!wifiConnected) { // Use our global flag
+        Serial.println("Google Sheet: Cannot send data, WiFi not connected.");
+        return;
+    }
+
+    WiFiClientSecure client;
+    HTTPClient http;
+    client.setInsecure(); // Skip certificate validation
+
+    String url = GAS_URL;
+    url += "?timestamp=" + urlEncode(timestamp);
+    url += "&moisture=" + String(moisture, 1);
+
+    Serial.print("Google Sheet URL: "); Serial.println(url);
+
+    if (http.begin(client, url)) {
+        Serial.println("Google Sheet: Starting HTTPS GET request...");
+        int httpCode = http.GET();
+        if (httpCode > 0) {
+            Serial.print("Google Sheet: HTTP Response code: "); Serial.println(httpCode);
+            String payload = http.getString();
+            Serial.print("Google Sheet: Response payload: "); Serial.println(payload);
+        } else {
+            Serial.print("Google Sheet: HTTP GET request failed, error: "); Serial.println(http.errorToString(httpCode).c_str());
+        }
+        http.end();
+    } else {
+        Serial.println("Google Sheet: Unable to connect to URL.");
+    }
+}
+
+// --- End of File ---
