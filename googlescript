@@ -1,0 +1,74 @@
+/**
+ * doGet(e) function handles HTTP GET requests for logging sensor data or pump events.
+ * Checks 'eventType' parameter to determine action.
+ * - eventType='moisture': Logs timestamp and moisture to 'pump1' sheet.
+ * - eventType='pumpOff': Logs timestamp and duration to 'PumpLog' sheet.
+ */
+function doGet(e) {
+  // --- Configuration ---
+  var moistureSheetName = "pump1";   // Target sheet for moisture readings
+  var pumpLogSheetName = "PumpLog"; // Target sheet for pump cycle logs
+  // -------------------
+
+  Logger.log("==== doGet Execution Started ====");
+  Logger.log("Received parameters: " + JSON.stringify(e.parameter));
+
+  var eventType = (e && e.parameter && e.parameter.eventType) ? e.parameter.eventType : 'moisture'; // Default to moisture
+  var targetSheetName = "";
+  var dataToAppend = [];
+
+  Logger.log("Determined eventType: " + eventType);
+
+  try {
+    var ss = SpreadsheetApp.getActiveSpreadsheet();
+    var sheet = null;
+
+    // Extract parameters and determine target sheet based on eventType
+    if (eventType === 'pumpOff') {
+      targetSheetName = pumpLogSheetName;
+      sheet = ss.getSheetByName(targetSheetName);
+      var timestamp = (e && e.parameter && e.parameter.timestamp) ? e.parameter.timestamp : "No Timestamp";
+      var duration = (e && e.parameter && e.parameter.duration) ? e.parameter.duration : "No Duration";
+      dataToAppend = [timestamp, duration]; // Order: Off Timestamp, Duration (sec)
+      Logger.log("Event Type: pumpOff. Target Sheet: " + targetSheetName);
+
+    } else { // Default to 'moisture' event
+      targetSheetName = moistureSheetName;
+      sheet = ss.getSheetByName(targetSheetName);
+      var timestamp = (e && e.parameter && e.parameter.timestamp) ? e.parameter.timestamp : "No Timestamp";
+      var moisture = (e && e.parameter && e.parameter.moisture) ? e.parameter.moisture : "No Moisture";
+      dataToAppend = [timestamp, moisture]; // Order: Timestamp, Moisture (%)
+       // Ensure eventType defaults correctly if missing
+       if (eventType !== 'moisture'){
+           Logger.log("EventType missing or invalid, defaulting to 'moisture'. Target Sheet: " + targetSheetName);
+           eventType = 'moisture';
+       } else {
+            Logger.log("Event Type: moisture. Target Sheet: " + targetSheetName);
+       }
+    }
+
+    // Log whether the target sheet was found correctly
+    Logger.log("Sheet object found for name '" + targetSheetName + "': " + (sheet ? "Yes" : "NO! Check sheet name!"));
+
+    if (!sheet) {
+       Logger.log("Error: Sheet '" + targetSheetName + "' not found. Returning error response.");
+       return ContentService.createTextOutput("Error: Sheet '" + targetSheetName + "' not found.").setMimeType(ContentService.MimeType.TEXT);
+    }
+
+    Logger.log("Attempting to append row with data: [" + dataToAppend.join(", ") + "]");
+
+    // Append data to the determined sheet
+    sheet.appendRow(dataToAppend);
+
+    Logger.log("Append row successful.");
+    Logger.log("==== doGet Execution Completed Successfully ====");
+
+    return ContentService.createTextOutput("Success: Row added to " + targetSheetName).setMimeType(ContentService.MimeType.TEXT);
+
+  } catch (error) {
+    Logger.log("!!!! ERROR Caught: " + error + " !!!!");
+    if (error.stack) { Logger.log("Error Stack: " + error.stack); }
+    Logger.log("==== doGet Execution Failed ====");
+    return ContentService.createTextOutput("Error: " + error).setMimeType(ContentService.MimeType.TEXT);
+  }
+}
