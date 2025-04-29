@@ -1,0 +1,582 @@
+// =========================================================================
+// Includes
+// =========================================================================
+#include <Wire.h>              // For I2C communication (LCD)
+#include <LiquidCrystal_I2C.h> // For I2C LCD display
+#include <WiFi.h>              // For ESP32 Wi-Fi
+#include <ArduinoOTA.h>        // <<< ADDED: For Over-the-Air updates
+#include <time.h>              // For time functions (NTP, strftime)
+#include <WiFiClientSecure.h>  // For HTTPS communication
+#include <HTTPClient.h>        // For making HTTP(S) requests
+#include <UrlEncode.h>         // For encoding URL parameters
+
+// =========================================================================
+// Pin Definitions
+// =========================================================================
+#define RELAY_PIN 17    // ESP32 pin GPIO17 that connects to relay
+#define MOISTURE_PIN 36 // ESP32 pin GPIO36 (ADC0) that connects to AOUT pin of moisture sensor
+
+// =========================================================================
+// Calibration Values
+// =========================================================================
+const int AirValue = 3000;  // Calibrate this value in air (sensor out of soil)
+const int WaterValue = 1110; // Calibrate this value in water (sensor fully submerged)
+
+// =========================================================================
+// LCD Display Setup
+// =========================================================================
+const int LCD_I2C_ADDR = 0x27; // <<< SET YOUR LCD I2C ADDRESS HERE (e.g., 0x27 or 0x3F)
+const int LCD_COLS = 16;       // LCD columns (e.g., 16 or 20)
+const int LCD_ROWS = 2;        // LCD rows (e.g., 2 or 4)
+LiquidCrystal_I2C lcd(LCD_I2C_ADDR, LCD_COLS, LCD_ROWS);
+
+// =========================================================================
+// Wi-Fi Credentials
+// =========================================================================
+const char *ssid = "SET";       // <<< SET YOUR WIFI SSID HERE
+const char *password = "SET"; // <<< SET YOUR WIFI PASSWORD HERE
+
+// =========================================================================
+// Google Apps Script URL
+// =========================================================================
+// Replace with YOUR Google Apps Script Web App URL (ending in /exec)
+String GAS_URL = "SET"; // <<< SET YOUR GAS URL HERE
+
+// =========================================================================
+// NTP Time Setup
+// =========================================================================
+const char* ntpServer = "pool.ntp.org";
+// Timezone: Buckeye, AZ is MST (Mountain Standard Time), UTC-7, No DST
+// Current time: Tuesday, April 29, 2025 at 4:49 PM MST (UTC-7)
+const long gmtOffset_sec = -7 * 3600; // UTC-7 hours in seconds
+const int daylightOffset_sec = 0;    // No daylight saving offset for MST
+struct tm timeinfo;                  // Structure to hold time information
+char dateTimeStringBuff[20];         // Buffer for formatted date/time strings
+
+// =========================================================================
+// Timing Intervals (milliseconds)
+// =========================================================================
+const long sampleInterval = 10000;      // Sample moisture every 10 seconds
+const long timeUpdateInterval = 1000;   // Update displayed time every 1 second
+const long sheetUpdateInterval = 5 * 60 * 1000; // Log moisture to Sheet every 5 minutes
+unsigned long lastSampleTime = 0;
+unsigned long lastTimeUpdate = 0;
+unsigned long lastSheetUpdate = 0;
+
+// =========================================================================
+// Pump Control
+// =========================================================================
+const unsigned long maxPumpRunTime = 25 * 60 * 1000; // Max pump runtime: 25 minutes
+unsigned long pumpStartTime = 0;    // Timestamp when pump turned ON (millis)
+bool pumpIsRunning = false;        // Flag for current pump state
+
+// =========================================================================
+// Wi-Fi Connection State
+// =========================================================================
+const unsigned long wifiReconnectInterval = 60 * 1000; // Reconnect attempt interval (60s)
+bool wifiConnected = false;        // Global flag for Wi-Fi status
+unsigned long lastWiFiReconnectTime = 0;
+
+// =========================================================================
+// Hysteresis Parameters
+// =========================================================================
+const float moistureThresholdDry = 40.0; // Turn pump ON below this minus hysteresis
+const float moistureHysteresis = 5.0;  // Percentage points of hysteresis band
+
+// =========================================================================
+// Function Prototypes
+// =========================================================================
+void updateMoistureAndPump(float moisturePercentage, unsigned long currentMillis);
+void checkPumpRuntime(unsigned long currentMillis);
+bool connectWiFi();
+void checkWiFiConnection();
+void logMoistureReading(const char* timestamp, int moisture);
+void logPumpEvent(const char* timestamp, unsigned long durationMillis);
+void sendDataToGAS(String url);
+void startOTA(); // <<< ADDED: Prototype for OTA setup function
+
+// =========================================================================
+// SETUP - Runs once on boot/reset
+// =========================================================================
+void setup()
+{
+    Serial.begin(9600);        // Start serial for debugging
+    pinMode(RELAY_PIN, OUTPUT);  // Set relay pin to output
+    digitalWrite(RELAY_PIN, LOW); // Ensure pump is OFF initially
+    analogSetAttenuation(ADC_11db); // Set ADC range for ESP32 (set before analogRead)
+
+    // --- LCD Initialization ---
+    Wire.begin();            // Init I2C
+    lcd.init();              // Init LCD
+    lcd.backlight();         // Turn on backlight
+    lcd.clear();             // Clear display
+    lcd.setCursor(0, 0);
+    lcd.print("System Starting");
+    Serial.println("System Starting...");
+    delay(1000);
+
+    // --- Connect to Wi-Fi ---
+    wifiConnected = connectWiFi();
+
+    // --- Configure NTP Time and OTA (only if Wi-Fi connected) ---
+    if (wifiConnected)
+    {
+        lcd.clear(); lcd.setCursor(0, 0); lcd.print("WiFi OK");
+        lcd.setCursor(0, 1); lcd.print("Syncing time...");
+        Serial.println("WiFi Connected. Configuring time from NTP...");
+        configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+
+        // Wait for time sync with timeout
+        int sync_attempts = 0; const int max_sync_attempts = 6;
+        while (!getLocalTime(&timeinfo, 5000)) {
+            Serial.print("Failed to obtain time. Retrying... (Attempt "); Serial.print(sync_attempts + 1); Serial.println(")");
+            sync_attempts++;
+            lcd.setCursor(0, 1); lcd.print("Time Sync Fail "); lcd.print(sync_attempts);
+            if (sync_attempts >= max_sync_attempts) {
+                 Serial.println("Giving up on initial time sync.");
+                 lcd.setCursor(0, 1); lcd.print("Time Sync Failed"); delay(2000); break;
+            }
+        }
+        if (sync_attempts < max_sync_attempts) {
+             Serial.println("Time synchronized successfully.");
+             getLocalTime(&timeinfo); // Get initial time
+             strftime(dateTimeStringBuff, sizeof(dateTimeStringBuff), "%H:%M:%S", &timeinfo); // Format just time for brief display
+             lcd.setCursor(0, 1); lcd.print("Time Synced! "); lcd.print(dateTimeStringBuff);
+             delay(2000);
+        }
+
+        // --- Start Arduino OTA --- // <<< ADDED: OTA Setup called here
+        startOTA();
+
+    } else {
+         // Handle Wi-Fi connection failure in setup
+         lcd.clear(); lcd.setCursor(0, 0); lcd.print("System Start");
+         lcd.setCursor(0, 1); lcd.print("No WiFi/OTA"); // <<< MODIFIED Message
+         delay(2000);
+    }
+
+    lcd.clear(); // Clear screen ready for main loop
+
+    // Initialize timers
+    lastSampleTime = millis();
+    lastTimeUpdate = millis();
+    lastWiFiReconnectTime = millis();
+    lastSheetUpdate = millis(); // Initialize sheet update timer
+    pumpStartTime = 0; // Ensure pump start time is initially zero
+}
+
+// =========================================================================
+// LOOP - Runs repeatedly after setup
+// =========================================================================
+void loop()
+{
+    ArduinoOTA.handle(); // <<< ADDED: Handle OTA requests at the start of loop
+
+    unsigned long currentMillis = millis(); // Get current time for comparisons
+
+    checkWiFiConnection();            // Check WiFi status, reconnect if needed
+    checkPumpRuntime(currentMillis);  // Check pump safety timer
+
+    // --- Update local time display periodically ---
+    if (wifiConnected && (currentMillis - lastTimeUpdate >= timeUpdateInterval))
+    {
+        lastTimeUpdate = currentMillis;
+        if (getLocalTime(&timeinfo)) {
+            strftime(dateTimeStringBuff, sizeof(dateTimeStringBuff), "%H:%M:%S", &timeinfo); // Format as HH:MM:SS for LCD
+            lcd.setCursor(0, 1); lcd.print(dateTimeStringBuff); // Print time on line 1
+        } else {
+            lcd.setCursor(0, 1); lcd.print("--:--:--"); // Indicate time sync lost
+        }
+        // Pump status will overwrite later part of line 1 below
+    }
+
+    // --- Check Moisture Sensor periodically ---
+    if (currentMillis - lastSampleTime >= sampleInterval)
+    {
+        lastSampleTime = currentMillis; // Update the last sample time
+
+        // Read sensor and calculate percentage
+        int sensorValue = analogRead(MOISTURE_PIN);
+        int moisturePercentage = map(sensorValue, AirValue, WaterValue, 0, 100);
+        moisturePercentage = constrain(moisturePercentage, 0, 100); // Constrain to 0-100
+
+        // Update pump state based on moisture
+        updateMoistureAndPump(moisturePercentage, currentMillis);
+
+        // --- Update LCD Display (Line 0: Moisture, Line 1: Pump Status) ---
+        lcd.setCursor(0, 0); // Go to start of first line
+        lcd.print("Moist: ");
+        lcd.print(moisturePercentage);
+        lcd.print("%   "); // Print % and pad with spaces
+
+        // Line 1: Pump Status (after the time HH:MM:SS<space>)
+        lcd.setCursor(9, 1); // Position after time string "HH:MM:SS "
+        lcd.print("Pmp:"); // Abbreviated label
+        lcd.print(pumpIsRunning ? "ON " : "OFF"); // Use 3 chars total ("ON "/"OFF")
+
+        // --- Log MOISTURE data periodically to Google Sheet ---
+        if (wifiConnected && (currentMillis - lastSheetUpdate >= sheetUpdateInterval)) {
+            lastSheetUpdate = currentMillis; // Update timestamp for sheet logging
+            if (getLocalTime(&timeinfo)) {
+                 strftime(dateTimeStringBuff, sizeof(dateTimeStringBuff), "%Y-%m-%d %H:%M:%S", &timeinfo); // Format full date/time
+                 Serial.println("----------------------------------------");
+                 Serial.print("Attempting to log MOISTURE to Google Sheet... Time: "); Serial.print(dateTimeStringBuff);
+                 Serial.print(" Moisture Value to Log: "); Serial.println(moisturePercentage);
+                 logMoistureReading(dateTimeStringBuff, moisturePercentage);
+                 Serial.println("----------------------------------------");
+            } else {
+                 Serial.println("Cannot log moisture to Google Sheet: Time not synced.");
+            }
+        }
+
+        // --- Print status to Serial Monitor for debugging ---
+        if(getLocalTime(&timeinfo)) strftime(dateTimeStringBuff, sizeof(dateTimeStringBuff), "%Y-%m-%d %H:%M:%S", &timeinfo); else strcpy(dateTimeStringBuff, "Time not synced");
+        Serial.print(dateTimeStringBuff);
+        Serial.print(" - Raw: "); Serial.print(sensorValue);
+        Serial.print(" Percent: "); Serial.print(moisturePercentage);
+        Serial.print("% Pump: "); Serial.println(pumpIsRunning ? "ON" : "OFF");
+    }
+} // End of loop()
+
+// =========================================================================
+// HELPER FUNCTIONS
+// =========================================================================
+
+/**
+ * @brief Decides pump state based on moisture and hysteresis. Logs pump OFF events.
+ */
+void updateMoistureAndPump(float moisturePercentage, unsigned long currentMillis) {
+    // Turn ON logic
+    if (moisturePercentage < (moistureThresholdDry - moistureHysteresis) && !pumpIsRunning) {
+        Serial.println("-> Turning Pump ON");
+        digitalWrite(RELAY_PIN, HIGH); pumpIsRunning = true; pumpStartTime = currentMillis;
+    }
+    // Turn OFF logic
+    else if (moisturePercentage >= (moistureThresholdDry + moistureHysteresis) && pumpIsRunning) {
+        Serial.println("-> Turning Pump OFF");
+        digitalWrite(RELAY_PIN, LOW); pumpIsRunning = false;
+        // Log the pump OFF event if WiFi is connected and we have a valid start time
+        if (wifiConnected && pumpStartTime > 0) {
+            unsigned long durationMillis = currentMillis - pumpStartTime;
+            if (getLocalTime(&timeinfo)) {
+                strftime(dateTimeStringBuff, sizeof(dateTimeStringBuff), "%Y-%m-%d %H:%M:%S", &timeinfo);
+                 Serial.println("----------------------------------------");
+                 Serial.print("Attempting to log PUMP OFF event... Time: "); Serial.print(dateTimeStringBuff);
+                 Serial.print(" Duration(ms): "); Serial.println(durationMillis);
+                logPumpEvent(dateTimeStringBuff, durationMillis);
+                 Serial.println("----------------------------------------");
+            } else { Serial.println("Cannot log pump event: Time not synced."); }
+        } else if (pumpStartTime == 0) { Serial.println("Pump turned off, but start time was zero. Not logging duration."); }
+         pumpStartTime = 0; // Reset start time after turning off and logging
+    }
+}
+
+/**
+ * @brief Checks if the pump has exceeded its maximum allowed runtime.
+ */
+void checkPumpRuntime(unsigned long currentMillis) {
+    if (pumpIsRunning && pumpStartTime > 0) { // Check pumpStartTime > 0 to avoid issues if it wasn't set correctly
+        if (currentMillis - pumpStartTime >= maxPumpRunTime) {
+            Serial.println("!!! Max pump runtime reached. Forcing Pump OFF. !!!");
+            digitalWrite(RELAY_PIN, LOW); pumpIsRunning = false; pumpStartTime = 0; // Reset state
+            lcd.clear(); lcd.setCursor(0, 0); lcd.print("Pump Runtime"); lcd.setCursor(0, 1); lcd.print("Limit Reached!");
+            delay(3000); // Show message
+            lcd.clear();
+            // Force screen refresh on next loop iteration
+            lastTimeUpdate = 0;
+            lastSampleTime = 0;
+        }
+    }
+}
+
+/**
+ * @brief Connects to the Wi-Fi network with retries and status display.
+ */
+bool connectWiFi() {
+    lcd.clear(); lcd.setCursor(0, 0); lcd.print("Connecting WiFi");
+    WiFi.mode(WIFI_STA); WiFi.begin(ssid, password);
+    Serial.print("Connecting to WiFi SSID: "); Serial.println(ssid);
+    int wifi_connect_counter = 0; const int max_wifi_attempts = 4; // Reduced attempts for faster feedback if failing
+    const unsigned long initial_wifi_delay = 1000; const unsigned long wifi_delay_increment = 1500; // Slightly adjusted delays
+
+    while (WiFi.status() != WL_CONNECTED && wifi_connect_counter < max_wifi_attempts) {
+        lcd.setCursor(wifi_connect_counter % LCD_COLS, 1); lcd.print(".");
+        unsigned long current_wifi_delay = initial_wifi_delay + (wifi_connect_counter * wifi_delay_increment);
+        Serial.print("Attempt "); Serial.print(wifi_connect_counter + 1); Serial.print(" of "); Serial.print(max_wifi_attempts);
+        Serial.print(" - Waiting "); Serial.print(current_wifi_delay / 1000.0, 1); Serial.println(" seconds...");
+        delay(current_wifi_delay);
+        wifi_connect_counter++;
+        // Serial.print("Current WiFi Status: "); Serial.println(WiFi.status()); // Optional: can be verbose
+    }
+
+    if (WiFi.status() == WL_CONNECTED) {
+        Serial.println("\nWiFi connected successfully!"); Serial.print("IP address: "); Serial.println(WiFi.localIP());
+        lcd.clear(); lcd.setCursor(0, 0); lcd.print("WiFi Connected!"); lcd.setCursor(0, 1); lcd.print(WiFi.localIP()); delay(2000);
+        return true;
+    } else {
+        Serial.println("\nFailed to connect to WiFi after multiple attempts.");
+        lcd.clear(); lcd.setCursor(0, 0); lcd.print("WiFi Connect"); lcd.setCursor(0, 1); lcd.print("Failed!"); delay(2000);
+        WiFi.disconnect(true); // Try to clean up resources
+        WiFi.mode(WIFI_OFF);   // Turn off WiFi module to save power if not connected
+        return false;
+    }
+}
+
+/**
+ * @brief Checks the Wi-Fi connection status and attempts to reconnect if disconnected. Also handles re-init of OTA.
+ */
+void checkWiFiConnection() {
+    unsigned long currentMillis = millis();
+    if (WiFi.status() != WL_CONNECTED) {
+        // Only print loss message once, and clear time display
+        if (wifiConnected) {
+            Serial.println("!!! WiFi connection lost! !!!");
+            wifiConnected = false;
+            lcd.setCursor(0, 1); lcd.print("--:--:--"); // Indicate time/conn loss
+        }
+        // Attempt reconnect periodically
+        if (currentMillis - lastWiFiReconnectTime >= wifiReconnectInterval) {
+            Serial.println("Attempting to reconnect to WiFi...");
+            lastWiFiReconnectTime = currentMillis;
+            lcd.clear(); lcd.setCursor(0, 0); lcd.print("WiFi Lost"); lcd.setCursor(0, 1); lcd.print("Reconnecting...");
+
+            wifiConnected = connectWiFi(); // Attempt to reconnect
+
+            if (wifiConnected) {
+                 Serial.println("Reconnected. Verifying time sync & Re-init OTA...");
+                 lcd.clear(); lcd.setCursor(0,0); lcd.print("Reconnected!");
+                 lcd.setCursor(0,1); lcd.print("Checking Time..."); delay(1000);
+                 // Re-sync time (optional, depends if time drift is critical)
+                 if (!getLocalTime(&timeinfo, 5000)) {
+                     Serial.println("Time sync pending after reconnect.");
+                     lcd.setCursor(0,1); lcd.print("Time Sync Pend");
+                 } else {
+                     Serial.println("Time OK after reconnect.");
+                     lcd.setCursor(0,1); lcd.print("Time OK!      ");
+                 }
+                 delay(1000);
+                 // Re-initialize OTA service after successful reconnect
+                 startOTA(); // Call the OTA setup function again
+                 lcd.clear(); // Clear screen for normal operation
+                 // Force screen refresh
+                 lastTimeUpdate = 0;
+                 lastSampleTime = 0;
+            } else {
+                // Reconnect failed
+                lcd.clear(); lcd.setCursor(0,0); lcd.print("Reconnect Fail"); delay(2000); lcd.clear();
+            }
+        }
+    } else {
+        // If Wi-Fi is connected but our flag was false (meaning it just reconnected)
+        if (!wifiConnected) {
+            Serial.println("WiFi connection (re)established.");
+            wifiConnected = true;
+            // Force screen refresh as state changed
+            lastTimeUpdate = 0;
+            lastSampleTime = 0;
+        }
+    }
+}
+
+/**
+ * @brief Configures and starts the Arduino OTA service.
+ */
+void startOTA() { // <<< ADDED: Function to handle OTA setup
+    // Optional: Set a hostname (identify it easier on the network)
+    ArduinoOTA.setHostname("ESP32-Soil-Sensor"); // Choose a descriptive name
+
+    // Optional: Set a password for OTA updates
+    // ArduinoOTA.setPassword("YourSecurePassword");
+
+    // --- Configure OTA callbacks (actions during update) ---
+    ArduinoOTA.onStart([]() {
+        String type;
+        if (ArduinoOTA.getCommand() == U_FLASH) {
+            type = "sketch";
+        } else { // U_SPIFFS
+            type = "filesystem"; // Not used in this sketch, but good practice
+        }
+        Serial.println("Start updating " + type);
+        // Display on LCD
+        lcd.clear();
+        lcd.setCursor(0, 0); lcd.print("OTA Update Start");
+        // Optional: Add actions like stopping the pump during update
+        digitalWrite(RELAY_PIN, LOW); // Ensure pump is OFF during update
+        pumpIsRunning = false;
+        pumpStartTime = 0;
+    });
+
+    ArduinoOTA.onEnd([]() {
+        Serial.println("\nEnd");
+        lcd.setCursor(0, 1); lcd.print("Update Finished!");
+        delay(1000); // Briefly show message
+        // ESP will reboot automatically after successful update.
+    });
+
+    ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+        int percentage = (progress / (total / 100));
+        Serial.printf("Progress: %u%%\r", percentage);
+        // Display progress on LCD
+        lcd.setCursor(0, 1);
+        lcd.print("Progress: ");
+        if (percentage < 10) lcd.print(" "); // Padding for alignment
+        if (percentage < 100) lcd.print(" ");
+        lcd.print(percentage); lcd.print("%");
+    });
+
+    ArduinoOTA.onError([](ota_error_t error) {
+        Serial.printf("Error[%u]: ", error);
+        // Display error on LCD
+        lcd.clear();
+        lcd.setCursor(0, 0); lcd.print("OTA Update Error");
+        lcd.setCursor(0, 1);
+        if (error == OTA_AUTH_ERROR) { Serial.println("Auth Failed"); lcd.print("Auth Failed"); }
+        else if (error == OTA_BEGIN_ERROR) { Serial.println("Begin Failed"); lcd.print("Begin Failed"); }
+        else if (error == OTA_CONNECT_ERROR) { Serial.println("Connect Failed"); lcd.print("Connect Failed"); }
+        else if (error == OTA_RECEIVE_ERROR) { Serial.println("Receive Failed"); lcd.print("Receive Failed"); }
+        else if (error == OTA_END_ERROR) { Serial.println("End Failed"); lcd.print("End Failed"); }
+        else { lcd.print("Unknown Error"); }
+        delay(3000); // Show error message
+    });
+
+    // --- Start the OTA service ---
+    ArduinoOTA.begin();
+
+    Serial.println("OTA Ready");
+    Serial.print("IP address: "); Serial.println(WiFi.localIP());
+
+    // Optional: Briefly display OTA status on LCD after setup/reconnect
+    // lcd.clear(); lcd.setCursor(0, 0); lcd.print("OTA Ready");
+    // lcd.setCursor(0, 1); lcd.print(WiFi.localIP()); delay(2000);
+    // lcd.clear(); // Clear for normal operation display
+}
+
+
+/**
+ * @brief Constructs URL and calls sender for MOISTURE readings.
+ */
+void logMoistureReading(const char* timestamp, int moisture) {
+     if (!wifiConnected) { Serial.println("LogMoisture: WiFi disconnected, skipping log."); return; }
+
+     // Debug print to check value being sent
+     Serial.print(">>> Preparing to log moisture: "); Serial.println(moisture);
+
+    String url = GAS_URL;
+    url += "?eventType=moisture";
+    url += "&timestamp=" + urlEncode(timestamp);
+    url += "&moisture=" + String(moisture); // Send as integer
+
+    sendDataToGAS(url);
+}
+
+/**
+ * @brief Constructs URL and calls sender for PUMP OFF events.
+ */
+void logPumpEvent(const char* timestamp, unsigned long durationMillis) {
+     if (!wifiConnected) { Serial.println("LogPump: WiFi disconnected, skipping log."); return; }
+
+     float durationSec = durationMillis / 1000.0; // Calculate seconds
+     Serial.print(">>> Preparing to log pump event. Duration (sec): "); Serial.println(durationSec, 1);
+
+    String url = GAS_URL;
+    url += "?eventType=pumpOff";
+    url += "&timestamp=" + urlEncode(timestamp); // OFF timestamp
+    url += "&duration=" + String(durationSec, 1); // Duration in seconds, 1 decimal place
+
+    sendDataToGAS(url);
+}
+
+/**
+ * @brief Central function to send data to Google Apps Script via HTTPS GET. Handles redirects.
+ */
+void sendDataToGAS(String url) {
+    if (!wifiConnected || WiFi.status() != WL_CONNECTED) {
+        Serial.println("GAS Sender: Cannot send data, WiFi not connected.");
+        return;
+    }
+
+    WiFiClientSecure client;
+    HTTPClient http;
+
+    // Allow insecure connections (HTTPS without certificate validation)
+    // WARNING: This is less secure but often necessary for simple HTTPS like Google Apps Script redirects.
+    client.setInsecure();
+
+    Serial.print("GAS Sender URL: "); Serial.println(url);
+
+    // Configure timeout (optional, default is 5000ms)
+    // http.setTimeout(10000); // 10 seconds
+
+    // Use a temporary string for begin() if URL might be long
+    String tempUrl = url;
+    if (http.begin(client, tempUrl)) { // Start connection
+        Serial.println("GAS Sender: Starting Initial HTTPS GET request...");
+        int httpCode = http.GET(); // Send the request
+
+        Serial.print("GAS Sender: Initial HTTP Response code: "); Serial.println(httpCode);
+
+        // Follow redirects manually (Google Apps Script often uses 302 Found)
+        if (httpCode == HTTP_CODE_MOVED_PERMANENTLY || httpCode == HTTP_CODE_FOUND || httpCode == HTTP_CODE_TEMPORARY_REDIRECT || httpCode == 308) {
+            String redirectUrl = http.header("Location"); // Get the redirect URL
+            Serial.print("GAS Sender: Redirect detected. Location: "); Serial.println(redirectUrl);
+            http.end(); // Close the first connection
+
+            if (!redirectUrl.isEmpty()) {
+                // Make the second request to the redirect URL
+                if (http.begin(client, redirectUrl)) {
+                    Serial.println("GAS Sender: Following redirect... Starting SECOND HTTPS GET request...");
+                    httpCode = http.GET(); // Send the second request
+                    Serial.print("GAS Sender: Second HTTP Response code: "); Serial.println(httpCode);
+
+                    if (httpCode > 0) { // Check for successful response (2xx)
+                         String payload = http.getString(); // Get response body
+                         Serial.print("GAS Sender: Final Response payload: "); Serial.println(payload);
+                         if (httpCode == HTTP_CODE_OK) {
+                            // Check payload for expected "Success" message from your script
+                            if (payload.startsWith("Success")) {
+                                Serial.println("GAS Sender: Data appears to be sent successfully!");
+                            } else {
+                                Serial.println("GAS Sender: Script executed but might have failed. Check payload/AppsScript logs.");
+                            }
+                         } else {
+                            Serial.println("GAS Sender: Error on second request. Unexpected HTTP code.");
+                         }
+                    } else { // Error on second request
+                        Serial.print("GAS Sender: SECOND HTTP GET request failed, error: ");
+                        Serial.println(http.errorToString(httpCode).c_str());
+                    }
+                    http.end(); // Close the second connection
+                } else {
+                    Serial.println("GAS Sender: Unable to connect to REDIRECT URL.");
+                }
+            } else {
+                Serial.println("GAS Sender: Redirect detected but Location header was empty.");
+            }
+        }
+        // Handle direct success or non-redirect errors from the initial request
+        else if (httpCode > 0) {
+             String payload = http.getString();
+             Serial.print("GAS Sender: Direct Response payload: "); Serial.println(payload);
+             if (httpCode == HTTP_CODE_OK) {
+                 if (payload.startsWith("Success")) {
+                    Serial.println("GAS Sender: Data appears to be sent successfully!");
+                 } else {
+                    Serial.println("GAS Sender: Script executed but might have failed. Check payload/AppsScript logs.");
+                 }
+             } else {
+                 Serial.println("GAS Sender: Direct request failed, unexpected HTTP code.");
+             }
+             http.end(); // Close the connection
+        }
+        // Handle connection or request error from the initial request
+        else {
+            Serial.print("GAS Sender: INITIAL HTTP GET request failed, error: ");
+            Serial.println(http.errorToString(httpCode).c_str());
+            http.end(); // Close the connection
+        }
+    } else {
+        Serial.println("GAS Sender: Unable to connect to INITIAL URL.");
+    }
+}
+
+// --- End of File ---
