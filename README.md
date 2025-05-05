@@ -15,3 +15,43 @@ Parts list:
 12. Tubing/hoses to match the water pump you choose.  This may not be needed if you are just using valves for pressurized water.
 13. Single channel relay like this: https://a.co/d/gGNozj5
 14. various lengths of scrap wire, that is an appropriate gauge for the voltage and amperage you intend to use
+
+
+If you are using an ESP32 and want to attach to wifi and upload data to Google Sheets
+
+Create an IFTTT Account: Go to ifttt.com and sign up for a free account if you don't have one.
+Create a New Applet: Click on "Create" or "My Applets" -> "New Applet".   
+Configure the Trigger ("IF This"):
+Click on the "+ This" button.
+Search for the service called Webhooks.
+Select the "Receive a web request" trigger.
+Choose an Event Name. This name is crucial as it will be part of the URL your ESP32 sends data to. Make it descriptive, for example: esp32_log or plant_data. Remember this name exactly.
+Click "Create trigger".
+Configure the Action ("Then That"):
+Click on the "+ That" button.
+Search for the service Google Sheets.
+Select the "Add row to spreadsheet" action.
+Connect Google Sheets: If you haven't used Google Sheets with IFTTT before, you'll need to click "Connect" and authorize IFTTT to access your Google account and manage your spreadsheets. Grant the necessary permissions.
+Configure Action Fields:
+Spreadsheet name: Enter the name you want for your Google Sheet (e.g., ESP32 Watering Data IFTTT). IFTTT can create this sheet if it doesn't exist in your Google Drive root folder.
+Formatted row: This is where you define what data goes into which column. The Webhook trigger provides "Ingredients" like {{EventName}}, {{Value1}}, {{Value2}}, {{Value3}}, and {{OccurredAt}}. You combine these to form a row. A good format might be: {{OccurredAt}} || {{Value1}} || {{Value2}} || {{Value3}} (The || acts as a column separator for Google Sheets).
+{{OccurredAt}}: Timestamp when IFTTT received the request.
+{{Value1}}: We can use this for the eventType ("moisture" or "pumpOff").
+{{Value2}}: We can use this for the moisture percentage.
+{{Value3}}: We can use this for the pump duration.
+  
+Drive folder path (optional): Specify a folder in Google Drive if you don't want the sheet created in the root.
+Click "Create action".
+Review and Finish: Give your Applet a title (optional) and click "Finish".
+Get Your Webhook URL and Key:
+Go to ifttt.com/maker_webhooks.
+Click on the "Documentation" button.
+You will see your unique Key. Copy this key carefully.
+You'll also see the URL structure: https://maker.ifttt.com/trigger/{event}/with/key/{your_key}
+Replace {event} with the Event Name you chose in step 3 (e.g., esp32_log).
+Replace {your_key} with the key you just copied.
+This complete URL is what your ESP32 will need to send data to.
+Part 2: Google Sheets Setup
+
+IFTTT will likely create the spreadsheet specified in step 4.
+Open the sheet once it's created. You should see columns based on your "Formatted row" definition. Add header names manually to the first row if IFTTT didn't (e.g., "Timestamp", "EventType", "Moisture (%)", "Pump Duration (s)").
